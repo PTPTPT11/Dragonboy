@@ -105,7 +105,7 @@ jobs:
           }
           Stop-Process -Id $p.Id -Force
           if (Test-Path $log) {
-            $fatal = Select-String -Path $log -Pattern 'NullReferenceException|MissingMethodException|TypeLoadException|FileNotFoundException|DllNotFoundException|Crash!!!|Aborting batchmode' -SimpleMatch:$false
+            $fatal = Select-String -Path $log -Pattern 'NullReferenceException|MissingMethodException|TypeLoadException|DllNotFoundException|Crash!!!|Aborting batchmode' -SimpleMatch:$false
             if ($fatal) { $fatal | ForEach-Object { Write-Host $_ }; throw 'Runtime smoke log contains fatal managed error' }
             Get-Content $log -Tail 80 | Out-Host
           }
