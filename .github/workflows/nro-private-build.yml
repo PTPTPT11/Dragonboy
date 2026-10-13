@@ -12,12 +12,12 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
     steps:
       - name: Checkout NRO Private source
         uses: actions/checkout@v4
 
-      - name: Download known-good Windows Mono player
+      - name: Download untouched known-good Windows Mono player
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -26,11 +26,14 @@ jobs:
           Expand-Archive -Path base.zip -DestinationPath base -Force
           $asm = Get-ChildItem base -Recurse -Filter Assembly-CSharp.dll | Select-Object -First 1
           if (-not $asm) { throw 'Assembly-CSharp.dll not found in base build' }
+          $exe = Get-ChildItem base -Recurse -File -Filter 'DragonBoy CommunityMod.exe' | Select-Object -First 1
+          if (-not $exe) { throw 'Stable Unity player executable not found' }
           "BASE_ASSEMBLY=$($asm.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
           "MANAGED_DIR=$($asm.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "PLAYER_ROOT=$($asm.Directory.Parent.Parent.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PLAYER_ROOT=$($exe.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "GAME_EXE=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Compile Assembly-CSharp from NRO Private source
+      - name: Compile standalone NRO Private addon against exact player assemblies
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -38,91 +41,95 @@ jobs:
           $vs = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
           $csc = Join-Path $vs 'MSBuild\Current\Bin\Roslyn\csc.exe'
           if (-not (Test-Path $csc)) { throw "csc.exe not found: $csc" }
-
-          $srcRoot = Join-Path $env:GITHUB_WORKSPACE 'GameProject\DragonBoy\Assets'
-          $sources = Get-ChildItem $srcRoot -Recurse -Filter *.cs | Where-Object {
-            $_.FullName -notmatch '\\Editor\\' -and
-            $_.Name -ne 'AssemblyAttributes.cs'
-          }
-          if ($sources.Count -lt 100) { throw "Unexpected source count: $($sources.Count)" }
+          "CSC=$csc" | Out-File -FilePath $env:GITHUB_ENV -Append
 
           New-Item -ItemType Directory -Path patched -Force | Out-Null
           $rsp = New-Object System.Collections.Generic.List[string]
           $rsp.Add('/nologo')
           $rsp.Add('/target:library')
-          $rsp.Add('/unsafe+')
           $rsp.Add('/optimize+')
           $rsp.Add('/langversion:latest')
           $rsp.Add('/nostdlib+')
-          $rsp.Add('/define:UNITY_STANDALONE;UNITY_STANDALONE_WIN;PLATFORM_STANDALONE_WIN')
-          $rsp.Add('/out:"' + (Join-Path $env:GITHUB_WORKSPACE 'patched\Assembly-CSharp.dll') + '"')
+          $rsp.Add('/out:"' + (Join-Path $env:GITHUB_WORKSPACE 'patched\NROPrivateAddon.dll') + '"')
+          Get-ChildItem $env:MANAGED_DIR -Filter *.dll | ForEach-Object { $rsp.Add('/reference:"' + $_.FullName + '"') }
+          $rsp.Add('"' + (Join-Path $env:GITHUB_WORKSPACE 'NROPrivateBuild\NROPrivateAddon.cs') + '"')
+          [IO.File]::WriteAllLines((Join-Path $env:GITHUB_WORKSPACE 'addon.rsp'), $rsp)
+          & $csc '@addon.rsp'
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path 'patched\NROPrivateAddon.dll')) { throw 'Addon compile failed' }
 
-          # Compile against the exact Mono/Unity runtime assemblies shipped by the known-good player.
-          $refs = Get-ChildItem $env:MANAGED_DIR -Filter *.dll | Where-Object { $_.Name -ne 'Assembly-CSharp.dll' }
-          foreach ($r in $refs) { $rsp.Add('/reference:"' + $r.FullName + '"') }
-          foreach ($s in $sources) { $rsp.Add('"' + $s.FullName + '"') }
-          $rspPath = Join-Path $env:GITHUB_WORKSPACE 'compile.rsp'
-          [IO.File]::WriteAllLines($rspPath, $rsp)
-
-          Write-Host "Compiling $($sources.Count) source files with $($refs.Count) Unity runtime references"
-          & $csc "@$rspPath"
-          if ($LASTEXITCODE -ne 0) { throw "C# compile failed with exit code $LASTEXITCODE" }
-          if (-not (Test-Path 'patched\Assembly-CSharp.dll')) { throw 'Patched Assembly-CSharp.dll missing' }
-
-      - name: Assemble single-client NRO PRIVATE package
+      - name: Patch one safe call into original Assembly-CSharp
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Copy-Item 'patched\Assembly-CSharp.dll' $env:BASE_ASSEMBLY -Force
+          nuget install Mono.Cecil -Version 0.11.6 -OutputDirectory packages -NonInteractive | Out-Host
+          $cecil = Get-ChildItem packages -Recurse -Filter Mono.Cecil.dll | Where-Object { $_.FullName -match 'net40' } | Select-Object -First 1
+          if (-not $cecil) { throw 'Mono.Cecil.dll not found' }
+          & $env:CSC /nologo /target:exe /optimize+ /out:patched\CecilPatcher.exe /reference:"$($cecil.FullName)" NROPrivateBuild\CecilPatcher.cs
+          if ($LASTEXITCODE -ne 0) { throw 'Cecil patcher compile failed' }
+          Copy-Item $cecil.FullName patched\Mono.Cecil.dll -Force
+          & patched\CecilPatcher.exe $env:BASE_ASSEMBLY patched\NROPrivateAddon.dll $env:MANAGED_DIR
+          if ($LASTEXITCODE -ne 0) { throw 'Assembly patch failed' }
+          Copy-Item patched\NROPrivateAddon.dll (Join-Path $env:MANAGED_DIR 'NROPrivateAddon.dll') -Force
 
-          $root = $env:PLAYER_ROOT
-          $exe = Get-ChildItem $root -File -Filter *.exe | Where-Object { $_.Name -notmatch 'CrashHandler' } | Select-Object -First 1
-          $data = Get-ChildItem $root -Directory | Where-Object { $_.Name -like '*_Data' } | Select-Object -First 1
-          if (-not $exe -or -not $data) { throw "Player exe/data directory not found under $root" }
+      - name: Compile NRO_PRIVATE launcher without renaming Unity player
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:CSC /nologo /target:winexe /optimize+ /out:patched\NRO_PRIVATE.exe /reference:System.Windows.Forms.dll NROPrivateBuild\Launcher.cs
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path 'patched\NRO_PRIVATE.exe')) { throw 'Launcher compile failed' }
+          Copy-Item patched\NRO_PRIVATE.exe (Join-Path $env:PLAYER_ROOT 'NRO_PRIVATE.exe') -Force
 
-          $out = Join-Path $env:GITHUB_WORKSPACE 'NRO_PRIVATE_FINAL'
+      - name: Static security checks
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ours = Get-ChildItem NROPrivateBuild -Recurse -Filter *.cs
+          $blocked = @('GetAsyncKeyState','SetWindowsHookEx','WH_KEYBOARD','CreateRemoteThread','WriteProcessMemory','VirtualAllocEx','discord.com/api/webhooks','api.telegram.org')
+          foreach ($p in $blocked) {
+            $m = $ours | Select-String -SimpleMatch $p
+            if ($m) { $m | ForEach-Object { Write-Host $_ }; throw "Blocked signature found: $p" }
+          }
+          $binaryText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Join-Path $env:MANAGED_DIR 'NROPrivateAddon.dll')))
+          foreach ($p in $blocked) { if ($binaryText.Contains($p)) { throw "Blocked binary signature found: $p" } }
+
+      - name: Runtime smoke test on Windows runner
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $log = Join-Path $env:GITHUB_WORKSPACE 'smoke-player.log'
+          $p = Start-Process -FilePath $env:GAME_EXE -ArgumentList '-logFile', $log -WorkingDirectory $env:PLAYER_ROOT -PassThru
+          Start-Sleep -Seconds 12
+          if ($p.HasExited) {
+            if (Test-Path $log) { Get-Content $log -Tail 250 | Out-Host }
+            throw "Game exited during smoke test with code $($p.ExitCode)"
+          }
+          Stop-Process -Id $p.Id -Force
+          if (Test-Path $log) {
+            $fatal = Select-String -Path $log -Pattern 'NullReferenceException|MissingMethodException|TypeLoadException|FileNotFoundException|DllNotFoundException|Crash!!!|Aborting batchmode' -SimpleMatch:$false
+            if ($fatal) { $fatal | ForEach-Object { Write-Host $_ }; throw 'Runtime smoke log contains fatal managed error' }
+            Get-Content $log -Tail 80 | Out-Host
+          }
+
+      - name: Package runnable client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:GITHUB_WORKSPACE 'NRO_PRIVATE_FINAL_V2'
           if (Test-Path $out) { Remove-Item $out -Recurse -Force }
           New-Item -ItemType Directory -Path $out | Out-Null
-          Copy-Item (Join-Path $root '*') $out -Recurse -Force
+          Copy-Item (Join-Path $env:PLAYER_ROOT '*') $out -Recurse -Force
+          Set-Content -Path (Join-Path $out 'README.txt') -Value "NRO PRIVATE V2`r`nChạy NRO_PRIVATE.exe.`r`nUnity player gốc được giữ nguyên để tránh màn hình đen.`r`nMenu MOD nằm trong game." -Encoding UTF8
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath NRO_PRIVATE_FINAL_V2.zip -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash NRO_PRIVATE_FINAL_V2.zip -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path NRO_PRIVATE_FINAL_V2.sha256 -Value "$hash  NRO_PRIVATE_FINAL_V2.zip" -Encoding ASCII
 
-          $copiedExe = Join-Path $out $exe.Name
-          $copiedData = Join-Path $out $data.Name
-          Rename-Item $copiedExe 'NRO_PRIVATE.exe'
-          Rename-Item $copiedData 'NRO_PRIVATE_Data'
-
-          Get-ChildItem $out -Recurse -File -Include '*.log','*.tmp' | Remove-Item -Force -ErrorAction SilentlyContinue
-          Set-Content -Path (Join-Path $out 'README.txt') -Value "NRO PRIVATE`r`nChạy NRO_PRIVATE.exe.`r`nMenu MOD nằm trực tiếp trong game." -Encoding UTF8
-
-          Compress-Archive -Path (Join-Path $out '*') -DestinationPath NRO_PRIVATE_FINAL.zip -CompressionLevel Optimal -Force
-          $hash = (Get-FileHash NRO_PRIVATE_FINAL.zip -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path NRO_PRIVATE_FINAL.sha256 -Value "$hash  NRO_PRIVATE_FINAL.zip" -Encoding ASCII
-
-      - name: Static security gates
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $sourceRoot = 'GameProject\DragonBoy\Assets\Scripts\Assembly-CSharp'
-          $patterns = @('GetAsyncKeyState','SetWindowsHookEx','WH_KEYBOARD_LL','discord.com/api/webhooks','api.telegram.org')
-          $bad = @()
-          foreach ($p in $patterns) {
-            $m = Get-ChildItem $sourceRoot -Recurse -Filter *.cs | Select-String -SimpleMatch $p
-            if ($m) { $bad += $m }
-          }
-          if ($bad.Count -gt 0) {
-            $bad | ForEach-Object { Write-Host $_ }
-            throw 'Security gate found blocked source signature(s)'
-          }
-          $socket = Get-Content 'GameProject\DragonBoy\Assets\Scripts\Assembly-CSharp\Mod\ModHelper\SocketClient.cs' -Raw
-          if ($socket -match 'TcpClient|NetworkStream|keyPress|keyRelease') {
-            throw 'External QLTK socket bridge is not fully disabled'
-          }
-
-      - name: Upload NRO PRIVATE FINAL
+      - name: Upload NRO PRIVATE FINAL V2
         uses: actions/upload-artifact@v4
         with:
-          name: NRO_PRIVATE_FINAL
+          name: NRO_PRIVATE_FINAL_V2
           path: |
-            NRO_PRIVATE_FINAL.zip
-            NRO_PRIVATE_FINAL.sha256
+            NRO_PRIVATE_FINAL_V2.zip
+            NRO_PRIVATE_FINAL_V2.sha256
+            smoke-player.log
           if-no-files-found: error
           retention-days: 7
