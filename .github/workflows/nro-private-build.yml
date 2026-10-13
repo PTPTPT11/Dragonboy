@@ -1,0 +1,131 @@
+name: NRO PRIVATE Windows Build
+
+on:
+  push:
+    branches: [nro-private-final]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout NRO Private source
+        uses: actions/checkout@v4
+
+      - name: Download known-good Windows Mono player
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/EHVNArchive/Dragonboy-CommunityMod-Builds/releases/download/latest/Build-StandaloneWindows-Mono2x.zip'
+          Invoke-WebRequest -Uri $url -OutFile base.zip -UseBasicParsing
+          Expand-Archive -Path base.zip -DestinationPath base -Force
+          $asm = Get-ChildItem base -Recurse -Filter Assembly-CSharp.dll | Select-Object -First 1
+          if (-not $asm) { throw 'Assembly-CSharp.dll not found in base build' }
+          "BASE_ASSEMBLY=$($asm.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "MANAGED_DIR=$($asm.Directory.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PLAYER_ROOT=$($asm.Directory.Parent.Parent.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Compile Assembly-CSharp from NRO Private source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          $csc = Join-Path $vs 'MSBuild\Current\Bin\Roslyn\csc.exe'
+          if (-not (Test-Path $csc)) { throw "csc.exe not found: $csc" }
+
+          $srcRoot = Join-Path $env:GITHUB_WORKSPACE 'GameProject\DragonBoy\Assets\Scripts\Assembly-CSharp'
+          $sources = Get-ChildItem $srcRoot -Recurse -Filter *.cs | Where-Object { $_.FullName -notmatch '\\Editor\\' }
+          if ($sources.Count -lt 100) { throw "Unexpected source count: $($sources.Count)" }
+
+          New-Item -ItemType Directory -Path patched -Force | Out-Null
+          $rsp = New-Object System.Collections.Generic.List[string]
+          $rsp.Add('/nologo')
+          $rsp.Add('/target:library')
+          $rsp.Add('/unsafe+')
+          $rsp.Add('/optimize+')
+          $rsp.Add('/langversion:latest')
+          $rsp.Add('/define:UNITY_STANDALONE;UNITY_STANDALONE_WIN;PLATFORM_STANDALONE_WIN')
+          $rsp.Add('/out:"' + (Join-Path $env:GITHUB_WORKSPACE 'patched\Assembly-CSharp.dll') + '"')
+
+          $skip = @('Assembly-CSharp.dll','mscorlib.dll','netstandard.dll','Microsoft.CSharp.dll','Mono.Security.dll')
+          $refs = Get-ChildItem $env:MANAGED_DIR -Filter *.dll | Where-Object {
+            $skip -notcontains $_.Name -and $_.Name -notlike 'System*.dll'
+          }
+          foreach ($r in $refs) { $rsp.Add('/reference:"' + $r.FullName + '"') }
+          foreach ($s in $sources) { $rsp.Add('"' + $s.FullName + '"') }
+          $rspPath = Join-Path $env:GITHUB_WORKSPACE 'compile.rsp'
+          [IO.File]::WriteAllLines($rspPath, $rsp)
+
+          & $csc "@$rspPath"
+          if ($LASTEXITCODE -ne 0) { throw "C# compile failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path 'patched\Assembly-CSharp.dll')) { throw 'Patched Assembly-CSharp.dll missing' }
+
+      - name: Assemble single-client NRO PRIVATE package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Copy-Item 'patched\Assembly-CSharp.dll' $env:BASE_ASSEMBLY -Force
+
+          $root = $env:PLAYER_ROOT
+          $exe = Get-ChildItem $root -File -Filter *.exe | Where-Object { $_.Name -notmatch 'CrashHandler' } | Select-Object -First 1
+          $data = Get-ChildItem $root -Directory | Where-Object { $_.Name -like '*_Data' } | Select-Object -First 1
+          if (-not $exe -or -not $data) { throw "Player exe/data directory not found under $root" }
+
+          $out = Join-Path $env:GITHUB_WORKSPACE 'NRO_PRIVATE_FINAL'
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+          New-Item -ItemType Directory -Path $out | Out-Null
+          Copy-Item (Join-Path $root '*') $out -Recurse -Force
+
+          $copiedExe = Join-Path $out $exe.Name
+          $copiedData = Join-Path $out $data.Name
+          Rename-Item $copiedExe 'NRO_PRIVATE.exe'
+          Rename-Item $copiedData 'NRO_PRIVATE_Data'
+
+          Get-ChildItem $out -Recurse -File -Include '*.log','*.tmp' | Remove-Item -Force -ErrorAction SilentlyContinue
+          $readme = @'
+          NRO PRIVATE
+          Chạy trực tiếp NRO_PRIVATE.exe.
+          Menu MOD nằm trong game.
+          Auto Train có: Hết quái đổi khu, Random khu, Không quay lại khu vừa đứng.
+          '@
+          Set-Content -Path (Join-Path $out 'README.txt') -Value $readme -Encoding UTF8
+
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath NRO_PRIVATE_FINAL.zip -CompressionLevel Optimal -Force
+          $hash = (Get-FileHash NRO_PRIVATE_FINAL.zip -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path NRO_PRIVATE_FINAL.sha256 -Value "$hash  NRO_PRIVATE_FINAL.zip" -Encoding ASCII
+
+      - name: Static security gates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sourceRoot = 'GameProject\DragonBoy\Assets\Scripts\Assembly-CSharp'
+          $patterns = @('GetAsyncKeyState','SetWindowsHookEx','WH_KEYBOARD_LL','discord.com/api/webhooks','api.telegram.org')
+          $bad = @()
+          foreach ($p in $patterns) {
+            $m = Get-ChildItem $sourceRoot -Recurse -Filter *.cs | Select-String -SimpleMatch $p
+            if ($m) { $bad += $m }
+          }
+          if ($bad.Count -gt 0) {
+            $bad | ForEach-Object { Write-Host $_ }
+            throw 'Security gate found blocked source signature(s)'
+          }
+          $socket = Get-Content 'GameProject\DragonBoy\Assets\Scripts\Assembly-CSharp\Mod\ModHelper\SocketClient.cs' -Raw
+          if ($socket -match 'TcpClient|NetworkStream|keyPress|keyRelease|Password|Username') {
+            throw 'External QLTK socket bridge is not fully disabled'
+          }
+
+      - name: Upload NRO PRIVATE FINAL
+        uses: actions/upload-artifact@v4
+        with:
+          name: NRO_PRIVATE_FINAL
+          path: |
+            NRO_PRIVATE_FINAL.zip
+            NRO_PRIVATE_FINAL.sha256
+          if-no-files-found: error
+          retention-days: 7
