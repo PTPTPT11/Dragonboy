@@ -53,20 +53,18 @@ jobs:
           $rsp.Add('/unsafe+')
           $rsp.Add('/optimize+')
           $rsp.Add('/langversion:latest')
+          $rsp.Add('/nostdlib+')
           $rsp.Add('/define:UNITY_STANDALONE;UNITY_STANDALONE_WIN;PLATFORM_STANDALONE_WIN')
           $rsp.Add('/out:"' + (Join-Path $env:GITHUB_WORKSPACE 'patched\Assembly-CSharp.dll') + '"')
 
-          # Keep runner BCL as compiler core; add Unity netstandard facade and all game/plugin dependencies.
-          $skip = @('Assembly-CSharp.dll','mscorlib.dll','Microsoft.CSharp.dll','Mono.Security.dll')
-          $refs = Get-ChildItem $env:MANAGED_DIR -Filter *.dll | Where-Object {
-            $skip -notcontains $_.Name -and $_.Name -notlike 'System*.dll'
-          }
+          # Compile against the exact Mono/Unity runtime assemblies shipped by the known-good player.
+          $refs = Get-ChildItem $env:MANAGED_DIR -Filter *.dll | Where-Object { $_.Name -ne 'Assembly-CSharp.dll' }
           foreach ($r in $refs) { $rsp.Add('/reference:"' + $r.FullName + '"') }
           foreach ($s in $sources) { $rsp.Add('"' + $s.FullName + '"') }
           $rspPath = Join-Path $env:GITHUB_WORKSPACE 'compile.rsp'
           [IO.File]::WriteAllLines($rspPath, $rsp)
 
-          Write-Host "Compiling $($sources.Count) source files with $($refs.Count) managed references"
+          Write-Host "Compiling $($sources.Count) source files with $($refs.Count) Unity runtime references"
           & $csc "@$rspPath"
           if ($LASTEXITCODE -ne 0) { throw "C# compile failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path 'patched\Assembly-CSharp.dll')) { throw 'Patched Assembly-CSharp.dll missing' }
